@@ -4,6 +4,7 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from hashlib import sha256
 
 from .validation import currency as validate_currency
 from .validation import integer
@@ -54,5 +55,47 @@ def generate_dataset(seed=42, normal_count=10, currency="BRL"):
         # Keep labels outside the transaction features to avoid label leakage.
         "transactions": [{k: v for k, v in r.items() if k != "scenario"} for r in rows],
         "labels": [{"transaction_id": r["id"], "scenario": r["scenario"]} for r in rows],
+    }
+
+
+def generate_benchmark(seed=42, normal_count=100, currency="BRL", test_percent=20):
+    """Create an entity-disjoint train/test manifest to reduce network leakage."""
+    integer(test_percent, "test_percent", 1, 99)
+    dataset = generate_dataset(seed, normal_count, currency)
+    parent = {}
+
+    def root(value):
+        parent.setdefault(value, value)
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(left, right):
+        left, right = root(left), root(right)
+        if left != right:
+            parent[max(left, right)] = min(left, right)
+
+    for row in dataset["transactions"]:
+        union(row["source_account_id"], row["destination_account_id"])
+    components = {}
+    for account in sorted(parent):
+        components.setdefault(root(account), []).append(account)
+    test_accounts = set()
+    assignments = []
+    for component, accounts in sorted(components.items()):
+        bucket = int(sha256(f"{seed}:{component}".encode()).hexdigest()[:8], 16) % 100
+        split = "test" if bucket < test_percent else "train"
+        if split == "test":
+            test_accounts.update(accounts)
+        assignments.append({"component_id": component, "account_ids": accounts, "split": split})
+    test_ids = {row["id"] for row in dataset["transactions"]
+                if row["source_account_id"] in test_accounts}
+    return {
+        **dataset, "schema_version": "3.0", "split_strategy": "CONNECTED_COMPONENT_HASH",
+        "test_percent": test_percent, "components": assignments,
+        "train_transaction_ids": [r["id"] for r in dataset["transactions"] if r["id"] not in test_ids],
+        "test_transaction_ids": [r["id"] for r in dataset["transactions"] if r["id"] in test_ids],
+        "manifest_sha256": sha256("|".join(sorted(test_ids)).encode()).hexdigest(),
     }
 
